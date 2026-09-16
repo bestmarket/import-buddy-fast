@@ -28,7 +28,7 @@ export function notify(title: string, body?: string, kind: NotifyKind = "info"):
   try {
     // Only surface the system notification when the tab isn't in focus.
     if (document.visibilityState === "visible" && document.hasFocus()) return;
-    new Notification(title, { body, tag: title });
+    new Notification(title, { ...(body ? { body } : {}), tag: title });
   } catch {
     /* notifications are a nicety, never a failure */
   }
