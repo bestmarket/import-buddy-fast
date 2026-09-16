@@ -194,6 +194,9 @@ function StudioPage() {
         </div>
       </section>
 
+      <VideoLibrary videos={videos} busyId={busyId} onChanged={refresh} />
+
+
       <ProductionDialog
         style={openStyle}
         projectId={projectId}
