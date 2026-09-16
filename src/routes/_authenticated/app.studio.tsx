@@ -1,19 +1,24 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useServerFn } from "@tanstack/react-start";
-import { Download, Loader2, Trash2 } from "lucide-react";
+import { Bell, CalendarClock, Download, Loader2, Pencil, PlayCircle, Trash2 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
 import { ProductionDialog } from "@/components/ProductionDialog";
+import { VideoEditor } from "@/components/VideoEditor";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 
 import { supabase } from "@/integrations/supabase/client";
 import { publishVideo } from "@/lib/channels.functions";
+import { notify, requestNotificationPermission } from "@/lib/notify";
 import { renderVideo } from "@/lib/renderVideo";
 import type { Scene, VideoStyle } from "@/lib/studio.functions";
 import {
   VIDEO_STYLES,
   buildScene,
   deleteVideo,
+  scheduleVideo,
   setVideoStatus,
   signAssets,
 } from "@/lib/studio.functions";
@@ -60,6 +65,8 @@ function StudioPage() {
 
   const [openStyle, setOpenStyle] = useState<VideoStyle | null>(null);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [editing, setEditing] = useState<VideoRow | null>(null);
+  const [liveProgress, setLiveProgress] = useState<Record<string, number>>({});
 
   const scripts = workspace.data?.scripts ?? [];
   const videos = (workspace.data?.videos ?? []) as unknown as VideoRow[];
@@ -74,10 +81,16 @@ function StudioPage() {
       const scenes = (video.scenes as Scene[]) ?? [];
       if (scenes.length === 0) return;
       setBusyId(video.id);
+      void requestNotificationPermission();
       try {
         for (let i = 0; i < scenes.length; i += 1) {
           if (scenes[i]?.imagePath && scenes[i]?.audioPath) continue;
           await runBuildScene({ data: { videoId: video.id, index: i, voice: "warm" } });
+          notify(
+            `Scene ${i + 1} of ${scenes.length} is ready`,
+            video.title || "Untitled video",
+            "success",
+          );
         }
 
         const fresh = await supabase
@@ -87,6 +100,7 @@ function StudioPage() {
           .single();
         if (fresh.error) throw new Error(fresh.error.message);
         const built = ((fresh.data.scenes as unknown as Scene[]) ?? []).filter((s) => s.imagePath);
+        if (built.length === 0) throw new Error("No scenes were built for this video.");
         const paths = built.flatMap((s) =>
           [s.imagePath, s.audioPath].filter((p): p is string => Boolean(p)),
         );
@@ -98,6 +112,8 @@ function StudioPage() {
         const ingredients = normalizeIngredients(
           (fresh.data as { settings?: unknown }).settings ?? video.settings,
         );
+
+        let lastSaved = 0;
         const blob = await renderVideo(
           built.map((s) => ({
             imageUrl: urlFor(s.imagePath)!,
@@ -105,6 +121,16 @@ function StudioPage() {
             caption: s.narration,
           })),
           ingredients,
+          (fraction) => {
+            const pct = 60 + Math.round(fraction * 35);
+            setLiveProgress((p) => ({ ...p, [video.id]: pct }));
+            if (pct - lastSaved >= 10) {
+              lastSaved = pct;
+              void runSetStatus({
+                data: { videoId: video.id, status: "rendering", progress: pct },
+              }).catch(() => undefined);
+            }
+          },
         );
 
         const { data: userData } = await supabase.auth.getUser();
@@ -121,10 +147,19 @@ function StudioPage() {
         try {
           const posted = await runPublish({ data: { videoId: video.id } });
           const ok = posted.results.filter((r) => r.status === "posted").length;
-          if (ok > 0) toast.success(`Video is ready and posted to ${ok} account(s)`);
-          else toast.success("Video is ready");
+          notify(
+            "Your video is ready to download",
+            ok > 0
+              ? `${video.title || "Untitled video"} · posted to ${ok} account(s)`
+              : video.title || "Untitled video",
+            "success",
+          );
         } catch {
-          toast.success("Video is ready, but auto-posting failed");
+          notify(
+            "Your video is ready to download",
+            "Auto-posting to your channels failed.",
+            "success",
+          );
         }
 
         await refresh();
@@ -134,8 +169,13 @@ function StudioPage() {
           () => undefined,
         );
         await refresh();
-        toast.error(message);
+        notify("Video failed", message, "error");
       } finally {
+        setLiveProgress((p) => {
+          const next = { ...p };
+          delete next[video.id];
+          return next;
+        });
         setBusyId(null);
       }
     },
@@ -150,17 +190,33 @@ function StudioPage() {
     return () => window.clearInterval(timer);
   }, [refresh]);
 
-  // Finish any video that is waiting to be assembled.
+  // Pick up any video left unfinished — including one whose render was cut
+  // short by a reload or a closed tab.
   const autoRan = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (busyId) return;
     const next = videos.find(
-      (v) => ["assembling", "queued"].includes(v.status) && !autoRan.current.has(v.id),
+      (v) =>
+        ["assembling", "queued", "building", "preparing", "rendering"].includes(v.status) &&
+        !autoRan.current.has(v.id),
     );
     if (!next) return;
     autoRan.current.add(next.id);
     void produce(next);
   }, [busyId, produce, videos]);
+
+  const rerender = useCallback(
+    async (videoId: string) => {
+      autoRan.current.add(videoId);
+      const { data, error } = await supabase.from("videos").select("*").eq("id", videoId).single();
+      if (error) {
+        toast.error(error.message);
+        return;
+      }
+      await produce(data as unknown as VideoRow);
+    },
+    [produce],
+  );
 
   if (workspace.isLoading) {
     return (
@@ -173,11 +229,25 @@ function StudioPage() {
   return (
     <div className="space-y-6">
       <section className="space-y-3">
-        <div>
-          <h2 className="text-sm font-medium text-foreground">Video style</h2>
-          <p className="text-xs text-muted-foreground">
-            Tap a look to open its production settings.
-          </p>
+        <div className="flex items-start justify-between gap-3">
+          <div>
+            <h2 className="text-sm font-medium text-foreground">Video style</h2>
+            <p className="text-xs text-muted-foreground">
+              Tap a look to open its production settings.
+            </p>
+          </div>
+          <Button
+            size="sm"
+            variant="outline"
+            onClick={async () => {
+              const ok = await requestNotificationPermission();
+              toast[ok ? "success" : "error"](
+                ok ? "Notifications are on" : "Notifications are blocked in your browser settings",
+              );
+            }}
+          >
+            <Bell className="mr-2 h-4 w-4" /> Alerts
+          </Button>
         </div>
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
           {VIDEO_STYLES.map((option) => (
@@ -200,8 +270,21 @@ function StudioPage() {
         </div>
       </section>
 
-      <VideoLibrary videos={videos} busyId={busyId} onChanged={refresh} />
+      <VideoLibrary
+        videos={videos}
+        busyId={busyId}
+        liveProgress={liveProgress}
+        onChanged={refresh}
+        onEdit={setEditing}
+        onResume={(video) => void produce(video)}
+      />
 
+      <VideoEditor
+        video={editing}
+        onClose={() => setEditing(null)}
+        onChanged={refresh}
+        onRerender={(id) => void rerender(id)}
+      />
 
       <ProductionDialog
         style={openStyle}
@@ -227,14 +310,27 @@ const STATUS_LABEL: Record<string, string> = {
   failed: "Failed",
 };
 
+function toLocalInput(iso: string | null): string {
+  if (!iso) return "";
+  const date = new Date(iso);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}T${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
 function VideoLibrary({
   videos,
   busyId,
+  liveProgress,
   onChanged,
+  onEdit,
+  onResume,
 }: {
   videos: VideoRow[];
   busyId: string | null;
+  liveProgress: Record<string, number>;
   onChanged: () => void | Promise<unknown>;
+  onEdit: (video: VideoRow) => void;
+  onResume: (video: VideoRow) => void;
 }) {
   const runSign = useServerFn(signAssets);
   const runDelete = useServerFn(deleteVideo);
@@ -296,7 +392,8 @@ function VideoLibrary({
       <div>
         <h2 className="text-sm font-medium text-foreground">Your videos</h2>
         <p className="text-xs text-muted-foreground">
-          Videos being made and finished videos both show up here.
+          Videos being made and finished videos both show up here. Keep this page open while a video
+          is being put together.
         </p>
       </div>
 
@@ -305,35 +402,51 @@ function VideoLibrary({
           <h3 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
             In progress
           </h3>
-          {working.map((video) => (
-            <div key={video.id} className="rounded-lg border border-border p-4">
-              <div className="flex items-start justify-between gap-3">
-                <div className="min-w-0">
-                  <p className="truncate text-sm font-medium text-foreground">
-                    {video.title || "Untitled video"}
-                  </p>
-                  <p className="mt-0.5 text-xs text-muted-foreground">
-                    {STATUS_LABEL[video.status] ?? video.status}
-                    {video.scheduled_at
-                      ? ` · ${new Date(video.scheduled_at).toLocaleString()}`
-                      : ""}
-                  </p>
+          {working.map((video) => {
+            const pct = liveProgress[video.id] ?? video.progress;
+            return (
+              <div key={video.id} className="rounded-lg border border-border p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div className="min-w-0">
+                    <p className="truncate text-sm font-medium text-foreground">
+                      {video.title || "Untitled video"}
+                    </p>
+                    <p className="mt-0.5 text-xs text-muted-foreground">
+                      {STATUS_LABEL[video.status] ?? video.status}
+                      {video.scheduled_at
+                        ? ` · ${new Date(video.scheduled_at).toLocaleString()}`
+                        : ""}
+                    </p>
+                  </div>
+                  <Loader2
+                    className={cn(
+                      "h-4 w-4 shrink-0 text-muted-foreground",
+                      busyId === video.id ? "animate-spin" : "",
+                    )}
+                  />
                 </div>
-                <Loader2
-                  className={cn(
-                    "h-4 w-4 shrink-0 text-muted-foreground",
-                    busyId === video.id ? "animate-spin" : "",
-                  )}
-                />
+                <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-muted">
+                  <div
+                    className="h-full rounded-full bg-primary transition-all"
+                    style={{ width: `${Math.max(5, Math.min(100, pct))}%` }}
+                  />
+                </div>
+                {busyId !== video.id ? (
+                  <div className="mt-3 flex flex-wrap gap-2">
+                    <Button size="sm" variant="outline" onClick={() => onResume(video)}>
+                      <PlayCircle className="mr-2 h-4 w-4" /> Continue now
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => onEdit(video)}>
+                      <Pencil className="mr-2 h-4 w-4" /> Edit
+                    </Button>
+                    <Button size="sm" variant="ghost" onClick={() => void remove(video.id)}>
+                      <Trash2 className="mr-2 h-4 w-4" /> Delete
+                    </Button>
+                  </div>
+                ) : null}
               </div>
-              <div className="mt-3 h-1.5 w-full overflow-hidden rounded-full bg-muted">
-                <div
-                  className="h-full rounded-full bg-primary transition-all"
-                  style={{ width: `${Math.max(5, Math.min(100, video.progress))}%` }}
-                />
-              </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
       ) : null}
 
@@ -354,8 +467,8 @@ function VideoLibrary({
                       Loading preview…
                     </div>
                   )}
-                  <div className="flex items-start justify-between gap-3 p-3">
-                    <div className="min-w-0">
+                  <div className="space-y-3 p-3">
+                    <div>
                       <p className="truncate text-sm font-medium text-foreground">
                         {video.title || "Untitled video"}
                       </p>
@@ -364,26 +477,27 @@ function VideoLibrary({
                         {video.style ? ` · ${video.style}` : ""}
                       </p>
                     </div>
-                    <div className="flex shrink-0 items-center gap-1">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Button size="sm" variant="outline" onClick={() => onEdit(video)}>
+                        <Pencil className="mr-2 h-4 w-4" /> Edit
+                      </Button>
                       {url ? (
-                        <a
-                          href={url}
-                          download
-                          className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-foreground"
-                          aria-label="Download video"
-                        >
-                          <Download className="h-4 w-4" />
-                        </a>
+                        <Button size="sm" variant="outline" asChild>
+                          <a href={url} download={`${video.title || "video"}.webm`}>
+                            <Download className="mr-2 h-4 w-4" /> Download
+                          </a>
+                        </Button>
                       ) : null}
-                      <button
-                        type="button"
+                      <Button
+                        size="sm"
+                        variant="ghost"
                         onClick={() => void remove(video.id)}
-                        className="rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
                         aria-label="Delete video"
                       >
                         <Trash2 className="h-4 w-4" />
-                      </button>
+                      </Button>
                     </div>
+                    <ScheduleRow video={video} onChanged={onChanged} />
                   </div>
                 </div>
               );
@@ -400,7 +514,7 @@ function VideoLibrary({
           {failed.map((video) => (
             <div
               key={video.id}
-              className="flex items-start justify-between gap-3 rounded-lg border border-destructive/40 bg-destructive/5 p-4"
+              className="space-y-3 rounded-lg border border-destructive/40 bg-destructive/5 p-4"
             >
               <div className="min-w-0">
                 <p className="truncate text-sm font-medium text-foreground">
@@ -410,18 +524,83 @@ function VideoLibrary({
                   {video.error ?? "Something went wrong while making this video."}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => void remove(video.id)}
-                className="shrink-0 rounded-md p-2 text-muted-foreground transition-colors hover:bg-accent hover:text-destructive"
-                aria-label="Delete video"
-              >
-                <Trash2 className="h-4 w-4" />
-              </button>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" variant="outline" onClick={() => onResume(video)}>
+                  <PlayCircle className="mr-2 h-4 w-4" /> Try again
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => onEdit(video)}>
+                  <Pencil className="mr-2 h-4 w-4" /> Edit
+                </Button>
+                <Button size="sm" variant="ghost" onClick={() => void remove(video.id)}>
+                  <Trash2 className="mr-2 h-4 w-4" /> Delete
+                </Button>
+              </div>
             </div>
           ))}
         </div>
       ) : null}
     </section>
+  );
+}
+
+function ScheduleRow({
+  video,
+  onChanged,
+}: {
+  video: VideoRow;
+  onChanged: () => void | Promise<unknown>;
+}) {
+  const runSchedule = useServerFn(scheduleVideo);
+  const [when, setWhen] = useState(() => toLocalInput(video.scheduled_at));
+  const [busy, setBusy] = useState(false);
+
+  async function save(value: string | null) {
+    setBusy(true);
+    try {
+      await runSchedule({
+        data: {
+          videoId: video.id,
+          scheduledAt: value ? new Date(value).toISOString() : null,
+        },
+      });
+      await onChanged();
+      toast.success(value ? "Posting time saved" : "Posting time cleared");
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Could not save the time");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2 border-t border-border pt-3">
+      <p className="flex items-center gap-2 text-xs text-muted-foreground">
+        <CalendarClock className="h-3.5 w-3.5" /> Post at
+      </p>
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          type="datetime-local"
+          className="h-9 w-auto flex-1"
+          value={when}
+          onChange={(e) => setWhen(e.target.value)}
+        />
+        <Button size="sm" disabled={busy || !when} onClick={() => void save(when)}>
+          {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : "Save"}
+        </Button>
+        {video.scheduled_at ? (
+          <Button
+            size="sm"
+            variant="ghost"
+            disabled={busy}
+            onClick={() => {
+              setWhen("");
+              void save(null);
+            }}
+          >
+            Clear
+          </Button>
+        ) : null}
+      </div>
+    </div>
   );
 }

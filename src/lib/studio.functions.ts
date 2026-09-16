@@ -739,6 +739,25 @@ export const setVideoStatus = createServerFn({ method: "POST" })
     return res.data;
   });
 
+/** Sets (or clears) the time a finished/pending video should go out. */
+export const scheduleVideo = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((input: unknown) =>
+    z
+      .object({ videoId: z.string().uuid(), scheduledAt: z.string().datetime().nullable() })
+      .parse(input),
+  )
+  .handler(async ({ data, context }) => {
+    const res = await context.supabase
+      .from("videos")
+      .update({ scheduled_at: data.scheduledAt } as never)
+      .eq("id", data.videoId)
+      .select("*")
+      .single();
+    if (res.error) throw new Error(res.error.message);
+    return res.data;
+  });
+
 export const deleteVideo = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((input: unknown) => z.object({ id: z.string().uuid() }).parse(input))

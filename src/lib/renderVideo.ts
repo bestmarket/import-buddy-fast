@@ -310,20 +310,36 @@ export async function renderVideo(
 
   let elapsed = 0;
 
+  // Drive frames with requestAnimationFrame, but always keep a timer fallback
+  // running: browsers freeze rAF in a background tab, which used to leave a
+  // render stuck forever at "rendering".
   const animate = (duration: number, draw: (t: number) => void) =>
     new Promise<void>((resolve) => {
       const start = performance.now();
+      let done = false;
       const step = () => {
+        if (done) return;
         const t = (performance.now() - start) / 1000;
         if (t >= duration) {
+          done = true;
           resolve();
           return;
         }
         draw(t);
         onProgress?.(Math.min(0.99, (elapsed + t) / total));
-        requestAnimationFrame(step);
+        schedule();
       };
-      step();
+      const schedule = () => {
+        let fired = false;
+        const once = () => {
+          if (fired) return;
+          fired = true;
+          step();
+        };
+        requestAnimationFrame(once);
+        window.setTimeout(once, 120);
+      };
+      schedule();
     });
 
   if (titleSeconds > 0) {
